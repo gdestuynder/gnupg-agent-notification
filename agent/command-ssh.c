@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <assert.h>
+#include <libnotify/notify.h>
 
 #include "agent.h"
 
@@ -717,7 +718,7 @@ open_control_file (FILE **r_fp, int append)
    NULL it is set to 1 if the key has the confirm flag set. */
 static gpg_error_t
 search_control_file (FILE *fp, const char *hexgrip,
-                     int *r_disabled, int *r_ttl, int *r_confirm)
+                     int *r_disabled, int *r_ttl, int *r_confirm, int *r_notify)
 {
   int c, i, n;
   char *p, *pend, line[256];
@@ -729,6 +730,8 @@ search_control_file (FILE *fp, const char *hexgrip,
 
   if (r_confirm)
     *r_confirm = 0;
+  if (r_notify)
+    *r_notify = 0;
 
   fseek (fp, 0, SEEK_SET);
   clearerr (fp);
@@ -806,6 +809,11 @@ search_control_file (FILE *fp, const char *hexgrip,
           if (r_confirm)
             *r_confirm = 1;
         }
+      else if (n == 6 && !memcmp (p, "notify", 6))
+        {
+          if (r_notify)
+             *r_notify = 1;
+        }
       else
         log_error ("invalid flag `%.*s' in `%s', line %d; ignored\n",
                    n, p, fname, lnr);
@@ -836,7 +844,7 @@ add_control_entry (ctrl_t ctrl, const char *hexgrip, const char *fmtfpr,
   if (err)
     return err;
 
-  err = search_control_file (fp, hexgrip, &disabled, NULL, NULL);
+  err = search_control_file (fp, hexgrip, &disabled, NULL, NULL, NULL);
   if (err && gpg_err_code(err) == GPG_ERR_EOF)
     {
       struct tm *tp;
@@ -871,7 +879,7 @@ ttl_from_sshcontrol (const char *hexgrip)
   if (open_control_file (&fp, 0))
     return 0; /* Error: Use the global default TTL.  */
 
-  if (search_control_file (fp, hexgrip, &disabled, &ttl, NULL)
+  if (search_control_file (fp, hexgrip, &disabled, &ttl, NULL, NULL)
       || disabled)
     ttl = 0;  /* Use the global default if not found or disabled.  */
 
@@ -894,7 +902,7 @@ confirm_flag_from_sshcontrol (const char *hexgrip)
   if (open_control_file (&fp, 0))
     return 1; /* Error: Better ask for confirmation.  */
 
-  if (search_control_file (fp, hexgrip, &disabled, NULL, &confirm)
+  if (search_control_file (fp, hexgrip, &disabled, NULL, &confirm, NULL)
       || disabled)
     confirm = 0;  /* If not found or disabled, there is no reason to
                      ask for confirmation.  */
@@ -904,6 +912,28 @@ confirm_flag_from_sshcontrol (const char *hexgrip)
   return confirm;
 }
 
+/* Scan the sshcontrol file and return the confirm flag.  */
+static int
+notify_flag_from_sshcontrol (const char *hexgrip)
+{
+  FILE *fp;
+  int disabled, notify;
+
+  if (!hexgrip || strlen (hexgrip) != 40)
+    return 1;  /* Wrong input: Better ask for confirmation.  */
+
+  if (open_control_file (&fp, 0))
+    return 1; /* Error: Better ask for confirmation.  */
+
+  if (search_control_file (fp, hexgrip, &disabled, NULL, NULL, &notify)
+      || disabled)
+    notify = 0;  /* If not found or disabled, there is no reason to
+                     ask for confirmation.  */
+
+  fclose (fp);
+
+  return notify;
+}
 
 
 
@@ -1966,7 +1996,7 @@ ssh_handler_request_identities (ctrl_t ctrl,
           hexgrip[40] = 0;
           if ( strlen (hexgrip) != 40 )
             continue;
-          if (search_control_file (ctrl_fp, hexgrip, &disabled, NULL, NULL)
+          if (search_control_file (ctrl_fp, hexgrip, &disabled, NULL, NULL, NULL)
               || disabled)
             continue;
 
@@ -2159,6 +2189,37 @@ data_sign (ctrl_t ctrl, ssh_signature_encoder_t sig_encoder,
   ctrl->use_auth_call = 0;
   if (err)
     goto out;
+
+  /* Notify if needed. */
+  if (notify_flag_from_sshcontrol (hexgrip))
+    {
+      gcry_sexp_t key;
+      char *comment = NULL;
+      char *msg;
+      char *fpr;
+
+      err = agent_raw_key_from_file (ctrl, ctrl->keygrip, &key);
+      if (err)
+        goto out;
+      gcry_sexp_t tmpsxp = gcry_sexp_find_token (key, "comment", 0);
+          if (tmpsxp)
+            comment = gcry_sexp_nth_string (tmpsxp, 1);
+          gcry_sexp_release (tmpsxp);
+      err = ssh_get_fingerprint_string (key, &fpr);
+      gcry_sexp_release (key);
+      if (err)
+        goto out;
+      msg = xmalloc(strlen(comment)+strlen(fpr)+19);
+      snprintf(msg, strlen(comment)+strlen(fpr)+19, "Key: %s\nFingerprint: %s", comment, fpr);
+      NotifyNotification * Agent = notify_notification_new ("ssh-agent signed challenge",  msg, "emblem-unlocked");
+      notify_notification_set_category (Agent, "ssh-agent");
+      notify_notification_set_timeout (Agent, 300);
+      notify_notification_show (Agent, NULL);
+      xfree(msg);
+      xfree (fpr);
+      if (err)
+        goto out;
+    }
 
   valuelist = gcry_sexp_nth (signature_sexp, 1);
   if (! valuelist)
@@ -3014,6 +3075,7 @@ start_command_handler_ssh (ctrl_t ctrl, gnupg_fd_t sock_client)
   estream_t stream_sock = NULL;
   gpg_error_t err = 0;
   int ret;
+  notify_init ("gpg-agent");
 
   /* Because the ssh protocol does not send us information about the
      the current TTY setting, we resort here to use those from startup
